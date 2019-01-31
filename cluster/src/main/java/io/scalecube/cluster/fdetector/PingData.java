@@ -2,19 +2,17 @@ package io.scalecube.cluster.fdetector;
 
 import io.scalecube.cluster.Member;
 
-import io.protostuff.Tag;
-
 /** DTO class. Supports FailureDetector messages (Ping, Ack, PingReq). */
 final class PingData {
   /** Message's source address. */
-  @Tag(1)
-  private final Member from;
+  private Member from;
   /** Message's destination address. */
-  @Tag(2)
-  private final Member to;
+  private Member to;
   /** Address of member, who originally initiated ping sequence. */
-  @Tag(3)
-  private final Member originalIssuer;
+  private Member originalIssuer;
+
+  /** Instantiates empty ping data for deserialization purpose. */
+  PingData() {}
 
   public PingData(Member from, Member to) {
     this.from = from;
@@ -42,8 +40,10 @@ final class PingData {
 
   @Override
   public String toString() {
-    return "PingData{from=" + from
-        + ", to=" + to
+    return "PingData{from="
+        + from
+        + ", to="
+        + to
         + (originalIssuer != null ? ", originalIssuer=" + originalIssuer : "")
         + '}';
   }

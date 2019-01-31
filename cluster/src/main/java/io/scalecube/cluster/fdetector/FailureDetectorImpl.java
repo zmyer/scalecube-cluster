@@ -1,15 +1,22 @@
 package io.scalecube.cluster.fdetector;
 
+import io.scalecube.cluster.CorrelationIdGenerator;
 import io.scalecube.cluster.Member;
 import io.scalecube.cluster.membership.MemberStatus;
 import io.scalecube.cluster.membership.MembershipEvent;
-import io.scalecube.cluster.membership.MembershipProtocol;
+import io.scalecube.transport.Address;
 import io.scalecube.transport.Message;
 import io.scalecube.transport.Transport;
-
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import reactor.core.Disposable;
 import reactor.core.Disposables;
 import reactor.core.publisher.DirectProcessor;
@@ -17,19 +24,6 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxProcessor;
 import reactor.core.publisher.FluxSink;
 import reactor.core.scheduler.Scheduler;
-import reactor.core.scheduler.Schedulers;
-
-import java.time.Duration;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.List;
-import java.util.Objects;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.ThreadLocalRandom;
-import java.util.concurrent.TimeUnit;
 
 public final class FailureDetectorImpl implements FailureDetector {
 
@@ -43,19 +37,20 @@ public final class FailureDetectorImpl implements FailureDetector {
 
   // Injected
 
+  private final Member localMember;
   private final Transport transport;
-  private final MembershipProtocol membership;
   private final FailureDetectorConfig config;
+  private final CorrelationIdGenerator cidGenerator;
 
   // State
 
-  private long period = 0;
+  private long currentPeriod = 0;
   private List<Member> pingMembers = new ArrayList<>();
   private int pingMemberIndex = 0; // index for sequential ping member selection
 
   // Disposables
 
-  private final Disposable.Composite actionDisposables = Disposables.composite();
+  private final Disposable.Composite actionsDisposables = Disposables.composite();
 
   // Subject
   private final FluxProcessor<FailureDetectorEvent, FailureDetectorEvent> subject =
@@ -64,84 +59,58 @@ public final class FailureDetectorImpl implements FailureDetector {
   private final FluxSink<FailureDetectorEvent> sink = subject.sink();
 
   // Scheduled
-  private final ScheduledExecutorService executor;
   private final Scheduler scheduler;
-  private ScheduledFuture<?> pingTask;
 
   /**
    * Creates new instance of failure detector with given transport and settings.
    *
-   * @param transport transport
-   * @param membership membership protocol
+   * @param localMember local cluster member
+   * @param transport cluster transport
+   * @param membershipProcessor membership event processor
    * @param config failure detector settings
+   * @param scheduler scheduler
+   * @param cidGenerator correlationId generator
    */
-  public FailureDetectorImpl(Transport transport, MembershipProtocol membership, FailureDetectorConfig config) {
-    this.transport = Objects.requireNonNull(transport);
-    this.membership = Objects.requireNonNull(membership);
-    this.config = Objects.requireNonNull(config);
-    String nameFormat = "sc-fdetector-" + Integer.toString(membership.member().address().port());
-    this.executor = Executors.newSingleThreadScheduledExecutor(r -> {
-      Thread thread = new Thread(r);
-      thread.setName(nameFormat);
-      thread.setDaemon(true);
-      return thread;
-    });
-    this.scheduler = Schedulers.fromExecutorService(executor);
-  }
+  public FailureDetectorImpl(
+      Member localMember,
+      Transport transport,
+      Flux<MembershipEvent> membershipProcessor,
+      FailureDetectorConfig config,
+      Scheduler scheduler,
+      CorrelationIdGenerator cidGenerator) {
 
-  /**
-   * <b>NOTE:</b> this method is for testing purpose only.
-   */
-  Transport getTransport() {
-    return transport;
+    this.localMember = Objects.requireNonNull(localMember);
+    this.transport = Objects.requireNonNull(transport);
+    this.config = Objects.requireNonNull(config);
+    this.scheduler = Objects.requireNonNull(scheduler);
+    this.cidGenerator = Objects.requireNonNull(cidGenerator);
+
+    // Subscribe
+    actionsDisposables.addAll(
+        Arrays.asList(
+            membershipProcessor //
+                .publishOn(scheduler)
+                .subscribe(this::onMemberEvent, this::onError),
+            transport
+                .listen() //
+                .publishOn(scheduler)
+                .subscribe(this::onMessage, this::onError)));
   }
 
   @Override
   public void start() {
-    actionDisposables.addAll(Arrays.asList(
-        membership.listen()
-            .publishOn(scheduler)
-            .filter(MembershipEvent::isAdded)
-            .map(MembershipEvent::member)
-            .subscribe(this::onMemberAdded, this::onError),
-        membership.listen()
-            .publishOn(scheduler)
-            .filter(MembershipEvent::isRemoved)
-            .map(MembershipEvent::member)
-            .subscribe(this::onMemberRemoved, this::onError),
-        membership.listen()
-            .publishOn(scheduler)
-            .filter(MembershipEvent::isUpdated)
-            .subscribe(this::onMemberUpdated, this::onError),
-        transport.listen()
-            .publishOn(scheduler)
-            .filter(this::isPing)
-            .subscribe(this::onPing, this::onError),
-        transport.listen()
-            .publishOn(scheduler)
-            .filter(this::isPingReq)
-            .subscribe(this::onPingReq, this::onError),
-        transport.listen()
-            .publishOn(scheduler)
-            .filter(this::isTransitPingAck)
-            .subscribe(this::onTransitPingAck, this::onError)));
-
-    pingTask = executor.scheduleWithFixedDelay(
-        this::doPing, config.getPingInterval(), config.getPingInterval(), TimeUnit.MILLISECONDS);
+    actionsDisposables.add(
+        scheduler.schedulePeriodically(
+            this::doPing,
+            config.getPingInterval(),
+            config.getPingInterval(),
+            TimeUnit.MILLISECONDS));
   }
 
   @Override
   public void stop() {
-    // Stop accepting requests
-    actionDisposables.dispose();
-
-    // Stop sending pings
-    if (pingTask != null) {
-      pingTask.cancel(true);
-    }
-
-    // Shutdown executor
-    executor.shutdown();
+    // Stop accepting requests and sending pings
+    actionsDisposables.dispose();
 
     // Stop publishing events
     sink.complete();
@@ -149,7 +118,7 @@ public final class FailureDetectorImpl implements FailureDetector {
 
   @Override
   public Flux<FailureDetectorEvent> listen() {
-    return subject.onBackpressureDrop();
+    return subject.onBackpressureBuffer();
   }
 
   // ================================================
@@ -158,7 +127,7 @@ public final class FailureDetectorImpl implements FailureDetector {
 
   private void doPing() {
     // Increment period counter
-    period++;
+    long period = currentPeriod++;
 
     // Select ping member
     Member pingMember = selectPingMember();
@@ -167,148 +136,199 @@ public final class FailureDetectorImpl implements FailureDetector {
     }
 
     // Send ping
-    Member localMember = membership.member();
-    String cid = localMember.id() + "-" + Long.toString(period);
+    String cid = cidGenerator.nextCid();
     PingData pingData = new PingData(localMember, pingMember);
-    Message pingMsg = Message.withData(pingData).qualifier(PING).correlationId(cid).build();
-    try {
-      LOGGER.trace("Send Ping[{}] to {}", period, pingMember);
-      transport.listen().publishOn(scheduler)
-          .filter(this::isPingAck)
-          .filter(message -> cid.equals(message.correlationId()))
-          .take(1)
-          .timeout(Duration.ofMillis(config.getPingTimeout()), scheduler)
-          .subscribe(
-              message -> {
-                LOGGER.trace("Received PingAck[{}] from {}", period, pingMember);
-                publishPingResult(pingMember, MemberStatus.ALIVE);
-              },
-              throwable -> {
-                LOGGER.trace("Timeout getting PingAck[{}] from {} within {} ms",
-                    period, pingMember, config.getPingTimeout());
-                doPingReq(pingMember, cid);
-              });
-      transport.send(pingMember.address(), pingMsg);
-    } catch (Exception cause) {
-      LOGGER.error("Exception on sending Ping[{}] to {}: {}", period, pingMember, cause.getMessage(), cause);
-    }
-  }
+    Message pingMsg =
+        Message.withData(pingData)
+            .qualifier(PING)
+            .correlationId(cid)
+            .sender(localMember.address())
+            .build();
 
-  private void doPingReq(final Member pingMember, String cid) {
-    final int timeout = config.getPingInterval() - config.getPingTimeout();
-    if (timeout <= 0) {
-      LOGGER.trace("No PingReq[{}] occurred, because no time left (pingInterval={}, pingTimeout={})",
-          period, config.getPingInterval(), config.getPingTimeout());
-      publishPingResult(pingMember, MemberStatus.SUSPECT);
-      return;
-    }
-
-    final List<Member> pingReqMembers = selectPingReqMembers(pingMember);
-    if (pingReqMembers.isEmpty()) {
-      LOGGER.trace("No PingReq[{}] occurred, because member selection is empty", period);
-      publishPingResult(pingMember, MemberStatus.SUSPECT);
-      return;
-    }
-
-    Member localMember = membership.member();
-    transport.listen().publishOn(scheduler)
-        .filter(this::isPingAck)
-        .filter(message -> cid.equals(message.correlationId()))
-        .take(1)
-        .timeout(Duration.ofMillis(timeout), scheduler)
+    LOGGER.trace("Send Ping[{}] to {}", period, pingMember);
+    Address address = pingMember.address();
+    transport
+        .requestResponse(pingMsg, address)
+        .timeout(Duration.ofMillis(config.getPingTimeout()), scheduler)
+        .publishOn(scheduler)
         .subscribe(
             message -> {
-              LOGGER.trace("Received transit PingAck[{}] from {} to {}", period, message.sender(), pingMember);
-              publishPingResult(pingMember, MemberStatus.ALIVE);
+              LOGGER.trace("Received PingAck[{}] from {}", period, pingMember);
+              publishPingResult(period, pingMember, MemberStatus.ALIVE);
             },
-            throwable -> {
-              LOGGER.trace("Timeout getting transit PingAck[{}] from {} to {} within {} ms",
-                  period, pingReqMembers, pingMember, timeout);
-              publishPingResult(pingMember, MemberStatus.SUSPECT);
-            });
+            ex -> {
+              LOGGER.debug(
+                  "Failed to get PingAck[{}] from {} within {} ms",
+                  period,
+                  pingMember,
+                  config.getPingTimeout());
 
-    PingData pingReqData = new PingData(localMember, pingMember);
-    Message pingReqMsg = Message.withData(pingReqData).qualifier(PING_REQ).correlationId(cid).build();
+              final int timeLeft = config.getPingInterval() - config.getPingTimeout();
+              final List<Member> pingReqMembers = selectPingReqMembers(pingMember);
+
+              if (timeLeft <= 0 || pingReqMembers.isEmpty()) {
+                LOGGER.trace("No PingReq[{}] occurred", period);
+                publishPingResult(period, pingMember, MemberStatus.SUSPECT);
+              } else {
+                doPingReq(currentPeriod, pingMember, pingReqMembers, cid);
+              }
+            });
+  }
+
+  private void doPingReq(
+      long period, final Member pingMember, final List<Member> pingReqMembers, String cid) {
+    Message pingReqMsg =
+        Message.withData(new PingData(localMember, pingMember))
+            .qualifier(PING_REQ)
+            .correlationId(cid)
+            .sender(localMember.address())
+            .build();
     LOGGER.trace("Send PingReq[{}] to {} for {}", period, pingReqMembers, pingMember);
-    for (Member pingReqMember : pingReqMembers) {
-      transport.send(pingReqMember.address(), pingReqMsg);
-    }
+
+    Duration timeout = Duration.ofMillis(config.getPingInterval() - config.getPingTimeout());
+    pingReqMembers.forEach(
+        member ->
+            transport
+                .requestResponse(pingReqMsg, member.address())
+                .timeout(timeout, scheduler)
+                .publishOn(scheduler)
+                .subscribe(
+                    message -> {
+                      LOGGER.trace(
+                          "Received transit PingAck[{}] from {} to {}",
+                          period,
+                          message.sender(),
+                          pingMember);
+                      publishPingResult(period, pingMember, MemberStatus.ALIVE);
+                    },
+                    throwable -> {
+                      LOGGER.trace(
+                          "Timeout getting transit PingAck[{}] from {} to {} within {} ms",
+                          period,
+                          pingReqMembers,
+                          pingMember,
+                          timeout);
+                      publishPingResult(period, pingMember, MemberStatus.SUSPECT);
+                    }));
   }
 
   // ================================================
   // ============== Event Listeners =================
   // ================================================
 
-  private void onMemberAdded(Member member) {
-    // insert member into random positions
-    int size = pingMembers.size();
-    int index = size > 0 ? ThreadLocalRandom.current().nextInt(size) : 0;
-    pingMembers.add(index, member);
-  }
-
-  private void onMemberRemoved(Member member) {
-    pingMembers.remove(member);
-  }
-
-  private void onMemberUpdated(MembershipEvent membershipEvent) {
-    int index = pingMembers.indexOf(membershipEvent.oldMember());
-    if (index != -1) { // except local
-      pingMembers.set(index, membershipEvent.newMember());
+  private void onMessage(Message message) {
+    if (isPing(message)) {
+      onPing(message);
+    } else if (isPingReq(message)) {
+      onPingReq(message);
+    } else if (isTransitPingAck(message)) {
+      onTransitPingAck(message);
     }
   }
 
-  /**
-   * Listens to PING message and answers with ACK.
-   */
+  /** Listens to PING message and answers with ACK. */
   private void onPing(Message message) {
-    LOGGER.trace("Received Ping: {}", message);
+    long period = this.currentPeriod;
+    LOGGER.trace("Received Ping[{}]", period);
     PingData data = message.data();
-    Member localMember = membership.member();
     if (!data.getTo().id().equals(localMember.id())) {
-      LOGGER.warn("Received Ping to {}, but local member is {}", data.getTo(), localMember);
+      LOGGER.warn(
+          "Received Ping[{}] to {}, but local member is {}", period, data.getTo(), localMember);
       return;
     }
     String correlationId = message.correlationId();
-    Message ackMessage = Message.withData(data).qualifier(PING_ACK).correlationId(correlationId).build();
-    LOGGER.trace("Send PingAck to {}", data.getFrom().address());
-    transport.send(data.getFrom().address(), ackMessage);
+    Message ackMessage =
+        Message.withData(data)
+            .qualifier(PING_ACK)
+            .correlationId(correlationId)
+            .sender(localMember.address())
+            .build();
+    Address address = data.getFrom().address();
+    LOGGER.trace("Send PingAck[{}] to {}", period, address);
+    transport
+        .send(address, ackMessage)
+        .subscribe(
+            null,
+            ex ->
+                LOGGER.debug(
+                    "Failed to send PingAck[{}] to {}, cause: {}", period, address, ex.toString()));
   }
 
-  /**
-   * Listens to PING_REQ message and sends PING to requested cluster member.
-   */
+  /** Listens to PING_REQ message and sends PING to requested cluster member. */
   private void onPingReq(Message message) {
-    LOGGER.trace("Received PingReq: {}", message);
+    long period = this.currentPeriod;
+    LOGGER.trace("Received PingReq[{}]", period);
     PingData data = message.data();
     Member target = data.getTo();
     Member originalIssuer = data.getFrom();
     String correlationId = message.correlationId();
-    PingData pingReqData = new PingData(membership.member(), target, originalIssuer);
-    Message pingMessage = Message.withData(pingReqData).qualifier(PING).correlationId(correlationId).build();
-    LOGGER.trace("Send transit Ping to {}", target.address());
-    transport.send(target.address(), pingMessage);
+    PingData pingReqData = new PingData(localMember, target, originalIssuer);
+    Message pingMessage =
+        Message.withData(pingReqData)
+            .qualifier(PING)
+            .correlationId(correlationId)
+            .sender(localMember.address())
+            .build();
+    Address address = target.address();
+    LOGGER.trace("Send transit Ping[{}] to {}", period, address);
+    transport
+        .send(address, pingMessage)
+        .subscribe(
+            null,
+            ex ->
+                LOGGER.debug(
+                    "Failed to send transit Ping[{}] to {}, cause: {}",
+                    period,
+                    address,
+                    ex.toString()));
   }
 
   /**
-   * Listens to ACK with message containing ORIGINAL_ISSUER then converts message to plain ACK and sends it to
-   * ORIGINAL_ISSUER.
+   * Listens to ACK with message containing ORIGINAL_ISSUER then converts message to plain ACK and
+   * sends it to ORIGINAL_ISSUER.
    */
   private void onTransitPingAck(Message message) {
-    LOGGER.trace("Received transit PingAck: {}", message);
+    long period = this.currentPeriod;
+    LOGGER.trace("Received transit PingAck[{}]", period);
     PingData data = message.data();
     Member target = data.getOriginalIssuer();
     String correlationId = message.correlationId();
     PingData originalAckData = new PingData(target, data.getTo());
-    Message originalAckMessage = Message.withData(originalAckData)
-        .qualifier(PING_ACK)
-        .correlationId(correlationId)
-        .build();
-    LOGGER.trace("Resend transit PingAck to {}", target.address());
-    transport.send(target.address(), originalAckMessage);
+    Message originalAckMessage =
+        Message.withData(originalAckData)
+            .qualifier(PING_ACK)
+            .correlationId(correlationId)
+            .sender(localMember.address())
+            .build();
+    Address address = target.address();
+    LOGGER.trace("Resend transit PingAck[{}] to {}", period, address);
+    transport
+        .send(address, originalAckMessage)
+        .subscribe(
+            null,
+            ex ->
+                LOGGER.debug(
+                    "Failed to resend transit PingAck[{}] to {}, cause: {}",
+                    period,
+                    address,
+                    ex.toString()));
   }
 
   private void onError(Throwable throwable) {
     LOGGER.error("Received unexpected error: ", throwable);
+  }
+
+  private void onMemberEvent(MembershipEvent event) {
+    Member member = event.member();
+    if (event.isRemoved()) {
+      pingMembers.remove(member);
+    }
+    if (event.isAdded()) {
+      // insert member into random positions
+      int size = pingMembers.size();
+      int index = size > 0 ? ThreadLocalRandom.current().nextInt(size) : 0;
+      pingMembers.add(index, member);
+    }
   }
 
   // ================================================
@@ -340,8 +360,8 @@ public final class FailureDetectorImpl implements FailureDetector {
     return selectAll ? candidates : candidates.subList(0, config.getPingReqMembers());
   }
 
-  private void publishPingResult(Member member, MemberStatus status) {
-    LOGGER.debug("Member {} detected as {}", member, status);
+  private void publishPingResult(long period, Member member, MemberStatus status) {
+    LOGGER.debug("Member {} detected as {} at [{}]", member, status, period);
     sink.next(new FailureDetectorEvent(member, status));
   }
 
@@ -353,11 +373,17 @@ public final class FailureDetectorImpl implements FailureDetector {
     return PING_REQ.equals(message.qualifier());
   }
 
-  private boolean isPingAck(Message message) {
-    return PING_ACK.equals(message.qualifier()) && message.<PingData>data().getOriginalIssuer() == null;
+  private boolean isTransitPingAck(Message message) {
+    return PING_ACK.equals(message.qualifier())
+        && message.<PingData>data().getOriginalIssuer() != null;
   }
 
-  private boolean isTransitPingAck(Message message) {
-    return PING_ACK.equals(message.qualifier()) && message.<PingData>data().getOriginalIssuer() != null;
+  /**
+   * <b>NOTE:</b> this method is for testing purpose only.
+   *
+   * @return transport
+   */
+  Transport getTransport() {
+    return transport;
   }
 }

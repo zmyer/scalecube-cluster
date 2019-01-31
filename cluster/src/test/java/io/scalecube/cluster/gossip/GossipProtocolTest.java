@@ -4,66 +4,75 @@ import static io.scalecube.cluster.ClusterMath.gossipConvergencePercent;
 import static io.scalecube.cluster.ClusterMath.gossipDisseminationTime;
 import static io.scalecube.cluster.ClusterMath.maxMessagesPerGossipPerNode;
 import static io.scalecube.cluster.ClusterMath.maxMessagesPerGossipTotal;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.scalecube.cluster.BaseTest;
 import io.scalecube.cluster.ClusterConfig;
 import io.scalecube.cluster.ClusterMath;
 import io.scalecube.cluster.Member;
-import io.scalecube.cluster.membership.DummyMembershipProtocol;
-import io.scalecube.cluster.membership.MembershipProtocol;
+import io.scalecube.cluster.membership.MembershipEvent;
 import io.scalecube.transport.Address;
 import io.scalecube.transport.Message;
 import io.scalecube.transport.Transport;
 import io.scalecube.transport.TransportConfig;
-
-import org.junit.Assert;
-import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.LongSummaryStatistics;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Stream;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.TestInfo;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 
-@RunWith(Parameterized.class)
-public class GossipProtocolTest extends BaseTest {
+class GossipProtocolTest extends BaseTest {
 
   private static final Logger LOGGER = LoggerFactory.getLogger(GossipProtocolTest.class);
 
-  private static List<Object[]> experiments = Arrays.asList(new Object[][] {
-      // N , L , D // N - num of nodes, L - msg loss percent, D - msg mean delay (ms)
-      {2, 0, 2}, // warm up
-      {2, 0, 2},
-      {3, 0, 2},
-      {5, 0, 2},
-      {10, 0, 2},
-      {10, 10, 2},
-      {10, 25, 2},
-      {10, 25, 100},
-      {10, 50, 2},
-      {50, 0, 2},
-      {50, 10, 2},
-      {50, 10, 100},
-  });
+  private static final List<int[]> experiments =
+      Arrays.asList(
+          new int[][] {
+            // N , L , D // N - num of nodes, L - msg loss percent, D - msg mean delay (ms)
+            {2, 0, 2}, // warm up
+            {2, 0, 2},
+            {3, 0, 2},
+            {5, 0, 2},
+            {10, 0, 2},
+            {10, 10, 2},
+            {10, 25, 2},
+            {10, 25, 100},
+            {10, 50, 2},
+            {50, 0, 2},
+            {50, 10, 2},
+            {50, 10, 100},
+          });
 
-  // Makes tests run longer since always awaits for maximum gossip lifetime, but performs more checks
+  // Makes tests run longer since always awaits for maximum gossip lifetime, but performs more
+  // checks
   private static final boolean awaitFullCompletion = true;
 
   // Allow to configure gossip settings other than defaults
   private static final long gossipInterval /* ms */ = ClusterConfig.DEFAULT_GOSSIP_INTERVAL;
   private static final int gossipFanout = ClusterConfig.DEFAULT_GOSSIP_FANOUT;
   private static final int gossipRepeatMultiplier = ClusterConfig.DEFAULT_GOSSIP_REPEAT_MULT;
-
 
   // Uncomment and modify params to run single experiment repeatedly
   // static {
@@ -78,25 +87,30 @@ public class GossipProtocolTest extends BaseTest {
   // }
   // }
 
-  @Parameterized.Parameters(name = "N={0}, Ploss={1}%, Tmean={2}ms")
-  public static List<Object[]> data() {
-    return experiments;
+  static Stream<Arguments> experiment() {
+    return experiments.stream().map(objects -> Arguments.of(objects[0], objects[1], objects[2]));
   }
 
-  private final int membersNum;
-  private final int lossPercent;
-  private final int meanDelay;
+  private Scheduler scheduler;
 
-  public GossipProtocolTest(int membersNum, int lossPercent, int meanDelay) {
-    this.membersNum = membersNum;
-    this.lossPercent = lossPercent;
-    this.meanDelay = meanDelay;
+  @BeforeEach
+  void setUp(TestInfo testInfo) {
+    scheduler = Schedulers.newSingle(testInfo.getDisplayName().replaceAll(" ", "_"), true);
   }
 
-  @Test
-  public void testGossipProtocol() throws Exception {
+  @AfterEach
+  void tearDown() {
+    if (scheduler != null) {
+      scheduler.dispose();
+    }
+  }
+
+  @ParameterizedTest(name = "N={0}, Ploss={1}%, Tmean={2}ms")
+  @MethodSource("experiment")
+  void testGossipProtocol(int membersNum, int lossPercent, int meanDelay) throws Exception {
     // Init gossip protocol instances
-    List<GossipProtocolImpl> gossipProtocols = initGossipProtocols(membersNum, lossPercent, meanDelay);
+    List<GossipProtocolImpl> gossipProtocols =
+        initGossipProtocols(membersNum, lossPercent, meanDelay);
 
     // Subscribe on gossips
     long disseminationTime = 0;
@@ -104,38 +118,49 @@ public class GossipProtocolTest extends BaseTest {
     LongSummaryStatistics messageLostStatsDissemination = null;
     LongSummaryStatistics messageSentStatsOverall = null;
     LongSummaryStatistics messageLostStatsOverall = null;
-    long gossipTimeout = ClusterMath.gossipTimeoutToSweep(gossipRepeatMultiplier, membersNum, gossipInterval);
+    long gossipTimeout =
+        ClusterMath.gossipTimeoutToSweep(gossipRepeatMultiplier, membersNum, gossipInterval);
     try {
       final String gossipData = "test gossip - " + ThreadLocalRandom.current().nextLong();
       final CountDownLatch latch = new CountDownLatch(membersNum - 1);
       final Map<Member, Member> receivers = new ConcurrentHashMap<>();
       final AtomicBoolean doubleDelivery = new AtomicBoolean(false);
       for (final GossipProtocolImpl protocol : gossipProtocols) {
-        protocol.listen().subscribe(gossip -> {
-          if (gossipData.equals(gossip.data())) {
-            boolean firstTimeAdded = receivers.put(protocol.getMember(), protocol.getMember()) == null;
-            if (firstTimeAdded) {
-              latch.countDown();
-            } else {
-              LOGGER.error("Delivered gossip twice to: {}", protocol.getTransport().address());
-              doubleDelivery.set(true);
-            }
-          }
-        });
+        protocol
+            .listen()
+            .subscribe(
+                gossip -> {
+                  if (gossipData.equals(gossip.data())) {
+                    boolean firstTimeAdded =
+                        receivers.put(protocol.getMember(), protocol.getMember()) == null;
+                    if (firstTimeAdded) {
+                      latch.countDown();
+                    } else {
+                      LOGGER.error(
+                          "Delivered gossip twice to: {}", protocol.getTransport().address());
+                      doubleDelivery.set(true);
+                    }
+                  }
+                });
       }
 
       // Spread gossip, measure and verify delivery metrics
       long start = System.currentTimeMillis();
-      gossipProtocols.get(0).spread(Message.fromData(gossipData));
+      gossipProtocols.get(0).spread(Message.fromData(gossipData)).subscribe();
       latch.await(2 * gossipTimeout, TimeUnit.MILLISECONDS); // Await for double gossip timeout
       disseminationTime = System.currentTimeMillis() - start;
       messageSentStatsDissemination = computeMessageSentStats(gossipProtocols);
       if (lossPercent > 0) {
         messageLostStatsDissemination = computeMessageLostStats(gossipProtocols);
       }
-      Assert.assertEquals("Not all members received gossip", membersNum - 1, receivers.size());
-      Assert.assertTrue("Too long dissemination time " + disseminationTime
-          + "ms (timeout " + gossipTimeout + "ms)", disseminationTime < gossipTimeout);
+      assertEquals(membersNum - 1, receivers.size(), "Not all members received gossip");
+      assertTrue(
+          disseminationTime < gossipTimeout,
+          "Too long dissemination time "
+              + disseminationTime
+              + "ms (timeout "
+              + gossipTimeout
+              + "ms)");
 
       // Await gossip lifetime plus few gossip intervals too ensure gossip is fully spread
       if (awaitFullCompletion) {
@@ -147,20 +172,27 @@ public class GossipProtocolTest extends BaseTest {
           messageLostStatsOverall = computeMessageLostStats(gossipProtocols);
         }
       }
-      Assert.assertFalse("Delivered gossip twice to same member", doubleDelivery.get());
+      assertFalse(doubleDelivery.get(), "Delivered gossip twice to same member");
     } finally {
       // Print theoretical results
-      LOGGER.info("Experiment params: N={}, Gfanout={}, Grepeat_mult={}, Tgossip={}ms Ploss={}%, Tmean={}ms",
+      LOGGER.info(
+          "Experiment params: "
+              + "N={}, Gfanout={}, Grepeat_mult={}, Tgossip={}ms Ploss={}%, Tmean={}ms",
           membersNum, gossipFanout, gossipRepeatMultiplier, gossipInterval, lossPercent, meanDelay);
-      double convergProb = gossipConvergencePercent(gossipFanout, gossipRepeatMultiplier, membersNum, lossPercent);
-      long expDissemTime = gossipDisseminationTime(gossipRepeatMultiplier, membersNum, gossipInterval);
-      int maxMsgPerNode = maxMessagesPerGossipPerNode(gossipFanout, gossipRepeatMultiplier, membersNum);
+      double convergProb =
+          gossipConvergencePercent(gossipFanout, gossipRepeatMultiplier, membersNum, lossPercent);
+      long expDissemTime =
+          gossipDisseminationTime(gossipRepeatMultiplier, membersNum, gossipInterval);
+      int maxMsgPerNode =
+          maxMessagesPerGossipPerNode(gossipFanout, gossipRepeatMultiplier, membersNum);
       int maxMsgTotal = maxMessagesPerGossipTotal(gossipFanout, gossipRepeatMultiplier, membersNum);
-      LOGGER.info("Expected dissemination time is {}ms with probability {}%", expDissemTime, convergProb);
+      LOGGER.info(
+          "Expected dissemination time is {}ms with probability {}%", expDissemTime, convergProb);
       LOGGER.info("Max messages sent per node {} and total {}", maxMsgPerNode, maxMsgTotal);
 
       // Print actual results
-      LOGGER.info("Actual dissemination time: {}ms (timeout {}ms)", disseminationTime, gossipTimeout);
+      LOGGER.info(
+          "Actual dissemination time: {}ms (timeout {}ms)", disseminationTime, gossipTimeout);
       LOGGER.info("Messages sent stats (diss.): {}", messageSentStatsDissemination);
       if (lossPercent > 0) {
         LOGGER.info("Messages lost stats (diss.): {}", messageLostStatsDissemination);
@@ -174,7 +206,6 @@ public class GossipProtocolTest extends BaseTest {
 
       // Destroy gossip protocol instances
       destroyGossipProtocols(gossipProtocols);
-
     }
   }
 
@@ -221,13 +252,23 @@ public class GossipProtocolTest extends BaseTest {
   }
 
   private GossipProtocolImpl initGossipProtocol(Transport transport, List<Address> members) {
-    MembershipProtocol dummyMembership = new DummyMembershipProtocol(transport.address(), members);
-    GossipConfig gossipConfig = ClusterConfig.builder()
-        .gossipFanout(gossipFanout)
-        .gossipInterval(gossipInterval)
-        .gossipRepeatMult(gossipRepeatMultiplier)
-        .build();
-    GossipProtocolImpl gossipProtocol = new GossipProtocolImpl(transport, dummyMembership, gossipConfig);
+    GossipConfig gossipConfig =
+        ClusterConfig.builder()
+            .gossipFanout(gossipFanout)
+            .gossipInterval(gossipInterval)
+            .gossipRepeatMult(gossipRepeatMultiplier)
+            .build();
+
+    Member localMember = new Member("member-" + transport.address().port(), transport.address());
+
+    Flux<MembershipEvent> membershipFlux =
+        Flux.fromIterable(members)
+            .filter(address -> !transport.address().equals(address))
+            .map(address -> new Member("member-" + address.port(), address))
+            .map(member -> MembershipEvent.createAdded(member, Collections.emptyMap()));
+
+    GossipProtocolImpl gossipProtocol =
+        new GossipProtocolImpl(localMember, transport, membershipFlux, gossipConfig, scheduler);
     gossipProtocol.start();
     return gossipProtocol;
   }
@@ -239,14 +280,13 @@ public class GossipProtocolTest extends BaseTest {
     }
 
     // Stop all transports
-    List<CompletableFuture<Void>> futures = new ArrayList<>();
+    List<Mono<Void>> futures = new ArrayList<>();
     for (GossipProtocolImpl gossipProtocol : gossipProtocols) {
-      CompletableFuture<Void> close = new CompletableFuture<>();
-      gossipProtocol.getTransport().stop(close);
-      futures.add(close);
+      futures.add(gossipProtocol.getTransport().stop());
     }
+
     try {
-      CompletableFuture.allOf(futures.toArray(new CompletableFuture[futures.size()])).get(30, TimeUnit.SECONDS);
+      Mono.when(futures).block(Duration.ofSeconds(30));
     } catch (Exception ignore) {
       LOGGER.warn("Failed to await transport termination");
     }

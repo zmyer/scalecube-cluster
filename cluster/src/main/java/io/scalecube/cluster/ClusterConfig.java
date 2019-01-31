@@ -4,8 +4,8 @@ import io.scalecube.cluster.fdetector.FailureDetectorConfig;
 import io.scalecube.cluster.gossip.GossipConfig;
 import io.scalecube.cluster.membership.MembershipConfig;
 import io.scalecube.transport.Address;
+import io.scalecube.transport.MessageCodec;
 import io.scalecube.transport.TransportConfig;
-
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -15,12 +15,11 @@ import java.util.Map;
 
 /**
  * Cluster configuration encapsulate settings needed cluster to create and successfully join.
- * 
+ *
  * @see MembershipConfig
  * @see FailureDetectorConfig
  * @see GossipConfig
  * @see TransportConfig
- *
  */
 public final class ClusterConfig implements FailureDetectorConfig, GossipConfig, MembershipConfig {
 
@@ -44,7 +43,8 @@ public final class ClusterConfig implements FailureDetectorConfig, GossipConfig,
   public static final int DEFAULT_WAN_GOSSIP_FANOUT = 4;
   public static final int DEFAULT_WAN_CONNECT_TIMEOUT = 10_000;
 
-  // Default settings for local cluster working via loopback interface (overrides default/LAN settings)
+  // Default settings for local cluster working via loopback interface (overrides default/LAN
+  // settings)
   public static final int DEFAULT_LOCAL_SUSPICION_MULT = 3;
   public static final int DEFAULT_LOCAL_SYNC_INTERVAL = 15_000;
   public static final int DEFAULT_LOCAL_PING_TIMEOUT = 200;
@@ -53,6 +53,8 @@ public final class ClusterConfig implements FailureDetectorConfig, GossipConfig,
   public static final int DEFAULT_LOCAL_PING_REQ_MEMBERS = 1;
   public static final int DEFAULT_LOCAL_GOSSIP_INTERVAL = 100;
   public static final int DEFAULT_LOCAL_CONNECT_TIMEOUT = 1_000;
+
+  public static final int DEFAULT_METADATA_TIMEOUT = 3_000;
 
   public static final String DEFAULT_MEMBER_HOST = null;
   public static final Integer DEFAULT_MEMBER_PORT = null;
@@ -63,6 +65,7 @@ public final class ClusterConfig implements FailureDetectorConfig, GossipConfig,
   private final int syncTimeout;
   private final int suspicionMult;
   private final String syncGroup;
+  private final int metadataTimeout;
 
   private final int pingInterval;
   private final int pingTimeout;
@@ -83,6 +86,7 @@ public final class ClusterConfig implements FailureDetectorConfig, GossipConfig,
     this.syncTimeout = builder.syncTimeout;
     this.syncGroup = builder.syncGroup;
     this.suspicionMult = builder.suspicionMult;
+    this.metadataTimeout = builder.metadataTimeout;
 
     this.pingInterval = builder.pingInterval;
     this.pingTimeout = builder.pingTimeout;
@@ -109,9 +113,7 @@ public final class ClusterConfig implements FailureDetectorConfig, GossipConfig,
     return defaultConfig();
   }
 
-  /**
-   * Creates cluster config with default settings for cluster on WAN network.
-   */
+  /** Creates cluster config with default settings for cluster on WAN network. */
   public static ClusterConfig defaultWanConfig() {
     return builder()
         .suspicionMult(DEFAULT_WAN_SUSPICION_MULT)
@@ -123,9 +125,7 @@ public final class ClusterConfig implements FailureDetectorConfig, GossipConfig,
         .build();
   }
 
-  /**
-   * Creates cluster config with default settings for cluster on local loopback interface.
-   */
+  /** Creates cluster config with default settings for cluster on local loopback interface. */
   public static ClusterConfig defaultLocalConfig() {
     return builder()
         .suspicionMult(DEFAULT_LOCAL_SUSPICION_MULT)
@@ -161,6 +161,10 @@ public final class ClusterConfig implements FailureDetectorConfig, GossipConfig,
 
   public String getSyncGroup() {
     return syncGroup;
+  }
+
+  public int getMetadataTimeout() {
+    return metadataTimeout;
   }
 
   public int getPingInterval() {
@@ -201,21 +205,39 @@ public final class ClusterConfig implements FailureDetectorConfig, GossipConfig,
 
   @Override
   public String toString() {
-    return "ClusterConfig{seedMembers=" + seedMembers
-        + ", metadata=" + metadata
-        + ", syncInterval=" + syncInterval
-        + ", syncTimeout=" + syncTimeout
-        + ", suspicionMult=" + suspicionMult
-        + ", syncGroup='" + syncGroup + '\''
-        + ", pingInterval=" + pingInterval
-        + ", pingTimeout=" + pingTimeout
-        + ", pingReqMembers=" + pingReqMembers
-        + ", gossipInterval=" + gossipInterval
-        + ", gossipFanout=" + gossipFanout
-        + ", gossipRepeatMult=" + gossipRepeatMult
-        + ", transportConfig=" + transportConfig
-        + ", memberHost=" + memberHost
-        + ", memberPort=" + memberPort
+    return "ClusterConfig{seedMembers="
+        + seedMembers
+        + ", metadata="
+        + metadata
+        + ", syncInterval="
+        + syncInterval
+        + ", syncTimeout="
+        + syncTimeout
+        + ", metadataTimeout="
+        + metadataTimeout
+        + ", suspicionMult="
+        + suspicionMult
+        + ", syncGroup='"
+        + syncGroup
+        + '\''
+        + ", pingInterval="
+        + pingInterval
+        + ", pingTimeout="
+        + pingTimeout
+        + ", pingReqMembers="
+        + pingReqMembers
+        + ", gossipInterval="
+        + gossipInterval
+        + ", gossipFanout="
+        + gossipFanout
+        + ", gossipRepeatMult="
+        + gossipRepeatMult
+        + ", transportConfig="
+        + transportConfig
+        + ", memberHost="
+        + memberHost
+        + ", memberPort="
+        + memberPort
         + '}';
   }
 
@@ -227,6 +249,7 @@ public final class ClusterConfig implements FailureDetectorConfig, GossipConfig,
     private int syncTimeout = DEFAULT_SYNC_TIMEOUT;
     private String syncGroup = DEFAULT_SYNC_GROUP;
     private int suspicionMult = DEFAULT_SUSPICION_MULT;
+    private int metadataTimeout = DEFAULT_METADATA_TIMEOUT;
 
     private int pingInterval = DEFAULT_PING_INTERVAL;
     private int pingTimeout = DEFAULT_PING_TIMEOUT;
@@ -288,6 +311,11 @@ public final class ClusterConfig implements FailureDetectorConfig, GossipConfig,
       return this;
     }
 
+    public Builder metadataTimeout(int metadataTimeout) {
+      this.metadataTimeout = metadataTimeout;
+      return this;
+    }
+
     public Builder pingInterval(int pingInterval) {
       this.pingInterval = pingInterval;
       return this;
@@ -318,21 +346,9 @@ public final class ClusterConfig implements FailureDetectorConfig, GossipConfig,
       return this;
     }
 
-    /**
-     * Sets all transport config settings equal to provided transport config.
-     */
+    /** Sets all transport config settings equal to provided transport config. */
     public Builder transportConfig(TransportConfig transportConfig) {
       this.transportConfigBuilder.fillFrom(transportConfig);
-      return this;
-    }
-
-    public Builder listenAddress(String listenAddress) {
-      this.transportConfigBuilder.listenAddress(listenAddress);
-      return this;
-    }
-
-    public Builder listenInterface(String listenInterface) {
-      this.transportConfigBuilder.listenInterface(listenInterface);
       return this;
     }
 
@@ -351,9 +367,15 @@ public final class ClusterConfig implements FailureDetectorConfig, GossipConfig,
       return this;
     }
 
+    public Builder messageCodec(MessageCodec messageCodec) {
+      this.transportConfigBuilder.messageCodec(messageCodec);
+      return this;
+    }
+
     /**
-     * Override the member host in cases when the transport address is not the address to be broadcast.
-     * 
+     * Override the member host in cases when the transport address is not the address to be
+     * broadcast.
+     *
      * @param memberHost Member host to broadcast
      * @return this builder
      */
@@ -364,7 +386,7 @@ public final class ClusterConfig implements FailureDetectorConfig, GossipConfig,
 
     /**
      * Override the member port in cases when the transport port is not the post to be broadcast.
-     * 
+     *
      * @param memberPort Member port to broadcast
      * @return this builder
      */
@@ -373,7 +395,11 @@ public final class ClusterConfig implements FailureDetectorConfig, GossipConfig,
       return this;
     }
 
-
+    /**
+     * Creates new clsuter config out of this builder.
+     *
+     * @return cluster config object
+     */
     public ClusterConfig build() {
       if (pingTimeout >= pingInterval) {
         throw new IllegalStateException("Ping timeout can't be bigger than ping interval");

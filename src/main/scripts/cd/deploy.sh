@@ -1,17 +1,17 @@
-#!/bin/sh
+#!/usr/bin/env sh
 
+DIRNAME=$(dirname $0)
+DEPLOY_EXEC_FILES=$(find $DIRNAME -name 'deploy-*.sh')
 
-commit_to_develop() { 
- git fetch
- git branch -r
- git checkout -B develop 
- git rebase master
- git commit --amend -m "++++ Prepare for next development iteration build: $TRAVIS_BUILD_NUMBER ++++"
- git push origin develop
-}
+echo       Running $0
+echo *-*-*-*-*-*-*-*-*-*-*-*-*-*
 
-mvn -P release release:prepare release:perform -DautoVersionSubmodules=true -DscmCommentPrefix="$TRAVIS_COMMIT_MESSAGE [skip ci] " -DskipTests=true -B -V -s travis-settings.xml
+mvn -P release deploy -Darguments=-DskipTests -B -V -s travis-settings.xml
+pip install --user -r requirements.txt
+$(dirname $0)/external_build.sh
 
+# extends deploy.sh
+for script_file in $DEPLOY_EXEC_FILES; do
+    . $script_file
+done
 
-mvn clean
-commit_to_develop

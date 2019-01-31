@@ -1,29 +1,25 @@
 package io.scalecube.cluster.membership;
 
-import io.protostuff.Tag;
-
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 
 /**
- * A class containing full membership table from specific member and used full synchronization between cluster members.
- *
+ * A class containing full membership table from specific member and used full synchronization
+ * between cluster members.
  */
-
 final class SyncData {
 
-  /**
-   * Full cluster membership table.
-   */
-  @Tag(1)
-  private final List<MembershipRecord> membership;
+  /** Full cluster membership table. */
+  private List<MembershipRecord> membership;
 
   /**
    * Sort of cluster identifier. Only members in the same sync group allowed to join into cluster.
    */
-  @Tag(2)
-  private final String syncGroup;
+  private String syncGroup;
+
+  /** Instantiates empty sync data for deserialization purpose. */
+  SyncData() {}
 
   public SyncData(Collection<MembershipRecord> membership, String syncGroup) {
     this.membership = new ArrayList<>(membership);
@@ -42,5 +38,4 @@ final class SyncData {
   public String toString() {
     return "SyncData{membership=" + membership + ", syncGroup=" + syncGroup + '}';
   }
-
 }

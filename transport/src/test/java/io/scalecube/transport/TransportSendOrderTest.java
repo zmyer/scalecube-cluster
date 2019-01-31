@@ -2,25 +2,24 @@ package io.scalecube.transport;
 
 import static io.scalecube.transport.TransportTestUtils.createTransport;
 import static io.scalecube.transport.TransportTestUtils.destroyTransport;
-import static org.junit.Assert.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
-import org.junit.After;
-import org.junit.Test;
-
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.LongSummaryStatistics;
 import java.util.Map;
 import java.util.concurrent.Callable;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.LongStream;
-
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInfo;
 import reactor.core.Disposable;
 import reactor.core.Exceptions;
 
@@ -30,34 +29,40 @@ public class TransportSendOrderTest extends BaseTest {
   private Transport client;
   private Transport server;
 
-  @After
+  /** Tear down. */
+  @AfterEach
   public final void tearDown() {
     destroyTransport(client);
     destroyTransport(server);
   }
 
   @Test
-  public void testSendOrderSingleThreadWithoutPromises() throws Exception {
+  public void testSendOrderSingleThreadWithoutPromises(TestInfo testInfo) throws Exception {
     server = createTransport();
 
     int iterationNum = 11; // +1 warm up iteration
     int sentPerIteration = 1000;
     long[] iterationTimeSeries = new long[iterationNum - 1];
     for (int i = 0; i < iterationNum; i++) {
-      LOGGER.info("####### {} : iteration = {}", testName.getMethodName(), i);
+      LOGGER.info("####### {} : iteration = {}", testInfo.getDisplayName(), i);
 
       client = createTransport();
       final List<Message> received = new ArrayList<>();
       final CountDownLatch latch = new CountDownLatch(sentPerIteration);
 
-      Disposable serverSubscriber = server.listen().subscribe(message -> {
-        received.add(message);
-        latch.countDown();
-      });
+      final Disposable serverSubscriber =
+          server
+              .listen()
+              .subscribe(
+                  message -> {
+                    received.add(message);
+                    latch.countDown();
+                  });
 
       long startAt = System.currentTimeMillis();
       for (int j = 0; j < sentPerIteration; j++) {
-        client.send(server.address(), Message.fromQualifier("q" + j));
+        Message message = Message.withQualifier("q" + j).sender(client.address()).build();
+        client.send(server.address(), message).subscribe();
       }
       latch.await(20, TimeUnit.SECONDS);
       long iterationTime = System.currentTimeMillis() - startAt;
@@ -72,12 +77,13 @@ public class TransportSendOrderTest extends BaseTest {
       destroyTransport(client);
     }
 
-    LongSummaryStatistics iterationTimeStats = LongStream.of(iterationTimeSeries).summaryStatistics();
+    LongSummaryStatistics iterationTimeStats =
+        LongStream.of(iterationTimeSeries).summaryStatistics();
     LOGGER.info("Iteration time stats (ms): {}", iterationTimeStats);
   }
 
   @Test
-  public void testSendOrderSingleThread() throws Exception {
+  public void testSendOrderSingleThread(TestInfo testInfo) throws Exception {
     server = createTransport();
 
     int iterationNum = 11; // +1 warm up iteration
@@ -85,31 +91,35 @@ public class TransportSendOrderTest extends BaseTest {
     long[] iterationTimeSeries = new long[iterationNum - 1];
     List<Long> totalSentTimeSeries = new ArrayList<>(sentPerIteration * (iterationNum - 1));
     for (int i = 0; i < iterationNum; i++) {
-      LOGGER.info("####### {} : iteration = {}", testName.getMethodName(), i);
+      LOGGER.info("####### {} : iteration = {}", testInfo.getDisplayName(), i);
       List<Long> iterSentTimeSeries = new ArrayList<>(sentPerIteration);
 
       client = createTransport();
       final List<Message> received = new ArrayList<>();
       final CountDownLatch latch = new CountDownLatch(sentPerIteration);
 
-      Disposable serverSubscriber = server.listen().subscribe(message -> {
-        received.add(message);
-        latch.countDown();
-      });
+      final Disposable serverSubscriber =
+          server
+              .listen()
+              .subscribe(
+                  message -> {
+                    received.add(message);
+                    latch.countDown();
+                  });
 
       long startAt = System.currentTimeMillis();
       for (int j = 0; j < sentPerIteration; j++) {
-        CompletableFuture<Void> sendPromise = new CompletableFuture<>();
         long sentAt = System.currentTimeMillis();
-        client.send(server.address(), Message.fromQualifier("q" + j), sendPromise);
-        sendPromise.whenComplete((aVoid, exception) -> {
-          if (exception == null) {
-            long sentTime = System.currentTimeMillis() - sentAt;
-            iterSentTimeSeries.add(sentTime);
-          } else {
-            LOGGER.error("Failed to send message in {} ms", System.currentTimeMillis() - sentAt, exception);
-          }
-        });
+        Message message = Message.withQualifier("q" + j).sender(client.address()).build();
+        client
+            .send(server.address(), message)
+            .subscribe(
+                avoid -> iterSentTimeSeries.add(System.currentTimeMillis() - sentAt),
+                th ->
+                    LOGGER.error(
+                        "Failed to send message in {} ms",
+                        System.currentTimeMillis() - sentAt,
+                        th));
       }
 
       latch.await(20, TimeUnit.SECONDS);
@@ -121,13 +131,15 @@ public class TransportSendOrderTest extends BaseTest {
 
       Thread.sleep(10); // await a bit for last msg confirmation
 
-      LongSummaryStatistics iterSentTimeStats = iterSentTimeSeries.stream().mapToLong(v -> v).summaryStatistics();
+      LongSummaryStatistics iterSentTimeStats =
+          iterSentTimeSeries.stream().mapToLong(v -> v).summaryStatistics();
       if (i == 0) { // warm up iteration
         LOGGER.info("Warm up iteration time: {} ms", iterationTime);
         LOGGER.info("Sent time stats warm up iter (ms): {}", iterSentTimeStats);
       } else {
         totalSentTimeSeries.addAll(iterSentTimeSeries);
-        LongSummaryStatistics totalSentTimeStats = totalSentTimeSeries.stream().mapToLong(v -> v).summaryStatistics();
+        LongSummaryStatistics totalSentTimeStats =
+            totalSentTimeSeries.stream().mapToLong(v -> v).summaryStatistics();
         LOGGER.info("Iteration time: {} ms", iterationTime);
         LOGGER.info("Sent time stats iter  (ms): {}", iterSentTimeStats);
         LOGGER.info("Sent time stats total (ms): {}", totalSentTimeStats);
@@ -137,36 +149,43 @@ public class TransportSendOrderTest extends BaseTest {
       destroyTransport(client);
     }
 
-    LongSummaryStatistics iterationTimeStats = LongStream.of(iterationTimeSeries).summaryStatistics();
+    LongSummaryStatistics iterationTimeStats =
+        LongStream.of(iterationTimeSeries).summaryStatistics();
     LOGGER.info("Iteration time stats (ms): {}", iterationTimeStats);
   }
 
   @Test
-  public void testSendOrderMultiThread() throws Exception {
+  public void testSendOrderMultiThread(TestInfo testInfo) throws Exception {
     Transport server = createTransport();
 
     final int total = 1000;
     for (int i = 0; i < 10; i++) {
-      LOGGER.info("####### {} : iteration = {}", testName.getMethodName(), i);
-      ExecutorService exec = Executors.newFixedThreadPool(4, r -> {
-        Thread thread = new Thread(r);
-        thread.setName("testSendOrderMultiThread");
-        thread.setDaemon(true);
-        return thread;
-      });
+      LOGGER.info("####### {} : iteration = {}", testInfo.getDisplayName(), i);
+      ExecutorService exec =
+          Executors.newFixedThreadPool(
+              4,
+              r -> {
+                Thread thread = new Thread(r);
+                thread.setName("testSendOrderMultiThread");
+                thread.setDaemon(true);
+                return thread;
+              });
 
       Transport client = createTransport();
       final List<Message> received = new ArrayList<>();
       final CountDownLatch latch = new CountDownLatch(4 * total);
-      server.listen().subscribe(message -> {
-        received.add(message);
-        latch.countDown();
-      });
+      server
+          .listen()
+          .subscribe(
+              message -> {
+                received.add(message);
+                latch.countDown();
+              });
 
-      Future<Void> f0 = exec.submit(sender(0, client, server.address(), total));
-      Future<Void> f1 = exec.submit(sender(1, client, server.address(), total));
-      Future<Void> f2 = exec.submit(sender(2, client, server.address(), total));
-      Future<Void> f3 = exec.submit(sender(3, client, server.address(), total));
+      final Future<Void> f0 = exec.submit(sender(0, client, server.address(), total));
+      final Future<Void> f1 = exec.submit(sender(1, client, server.address(), total));
+      final Future<Void> f2 = exec.submit(sender(2, client, server.address(), total));
+      final Future<Void> f3 = exec.submit(sender(3, client, server.address(), total));
 
       latch.await(20, TimeUnit.SECONDS);
 
@@ -197,14 +216,18 @@ public class TransportSendOrderTest extends BaseTest {
     }
   }
 
-  private Callable<Void> sender(final int id, final Transport client, final Address address, final int total) {
+  private Callable<Void> sender(
+      final int id, final Transport client, final Address address, final int total) {
     return () -> {
       for (int j = 0; j < total; j++) {
         String correlationId = id + "/" + j;
-        CompletableFuture<Void> sendPromise = new CompletableFuture<>();
-        client.send(address, Message.withQualifier("q").correlationId(correlationId).build(), sendPromise);
         try {
-          sendPromise.get(3, TimeUnit.SECONDS);
+          Message message =
+              Message.withQualifier("q")
+                  .correlationId(correlationId)
+                  .sender(client.address())
+                  .build();
+          client.send(address, message).block(Duration.ofSeconds(3));
         } catch (Exception e) {
           LOGGER.error("Failed to send message: j = {} id = {}", j, id, e);
           throw Exceptions.propagate(e);
@@ -227,5 +250,4 @@ public class TransportSendOrderTest extends BaseTest {
       assertEquals(id + "/" + k, group.get(id).get(k).correlationId());
     }
   }
-
 }

@@ -1,41 +1,40 @@
 package io.scalecube.cluster.gossip;
 
-import static io.netty.buffer.Unpooled.buffer;
-import static io.netty.buffer.Unpooled.copiedBuffer;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.scalecube.cluster.BaseTest;
 import io.scalecube.cluster.Member;
 import io.scalecube.transport.Address;
 import io.scalecube.transport.Message;
-import io.scalecube.transport.MessageCodec;
-
-import io.netty.buffer.ByteBuf;
-
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.Test;
-
+import io.scalecube.transport.JacksonMessageCodec;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+
+import io.scalecube.transport.MessageCodec;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
 public class GossipRequestTest extends BaseTest {
 
   private static final String testDataQualifier = "scalecube/testData";
 
   private TestData testData;
+  private MessageCodec messageCodec;
 
-  @Before
+  /** Setup. */
+  @BeforeEach
   public void init() throws Throwable {
     Map<String, String> properties = new HashMap<>();
     properties.put("key", "123");
-
     testData = new TestData();
     testData.setProperties(properties);
+    messageCodec = new JacksonMessageCodec();
   }
 
   @Test
@@ -43,20 +42,20 @@ public class GossipRequestTest extends BaseTest {
 
     Member from = new Member("0", Address.from("localhost:1234"));
     List<Gossip> gossips = getGossips();
-    Message message = Message.withData(new GossipRequest(gossips, from.id())).correlationId("CORR_ID").build();
+    Message message =
+        Message.withData(new GossipRequest(gossips, from.id())).correlationId("CORR_ID").build();
 
-    ByteBuf bb = buffer();
-    MessageCodec.serialize(message, bb);
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    messageCodec.serialize(message, out);
 
-    assertTrue(bb.readableBytes() > 0);
+    assertTrue(out.size() > 0);
 
-    ByteBuf input = copiedBuffer(bb);
-
-    Message deserializedMessage = MessageCodec.deserialize(input);
+    Message deserializedMessage =
+      messageCodec.deserialize(new ByteArrayInputStream(out.toByteArray()));
 
     assertNotNull(deserializedMessage);
-    Assert.assertEquals(deserializedMessage.data().getClass(), GossipRequest.class);
-    Assert.assertEquals("CORR_ID", deserializedMessage.correlationId());
+    assertEquals(deserializedMessage.data().getClass(), GossipRequest.class);
+    assertEquals("CORR_ID", deserializedMessage.correlationId());
 
     GossipRequest gossipRequest = deserializedMessage.data();
     assertNotNull(gossipRequest);
@@ -65,13 +64,15 @@ public class GossipRequestTest extends BaseTest {
 
     Object msgData = gossipRequest.gossips().get(0).message().data();
     assertNotNull(msgData);
-    assertTrue(msgData.toString(), msgData instanceof TestData);
+    assertTrue(msgData instanceof TestData, msgData.toString());
     assertEquals(testData.getProperties(), ((TestData) msgData).getProperties());
   }
 
   private List<Gossip> getGossips() {
-    Gossip request = new Gossip("idGossip", Message.withData(testData).qualifier(testDataQualifier).build());
-    Gossip request2 = new Gossip("idGossip2", Message.withData(testData).qualifier(testDataQualifier).build());
+    Gossip request =
+        new Gossip("idGossip", Message.withData(testData).qualifier(testDataQualifier).build());
+    Gossip request2 =
+        new Gossip("idGossip2", Message.withData(testData).qualifier(testDataQualifier).build());
     List<Gossip> gossips = new ArrayList<>(2);
     gossips.add(request);
     gossips.add(request2);
@@ -92,5 +93,4 @@ public class GossipRequestTest extends BaseTest {
       this.properties = properties;
     }
   }
-
 }

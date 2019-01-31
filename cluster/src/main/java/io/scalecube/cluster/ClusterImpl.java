@@ -1,125 +1,172 @@
 package io.scalecube.cluster;
 
-import static io.scalecube.cluster.fdetector.FailureDetectorImpl.PING;
-import static io.scalecube.cluster.fdetector.FailureDetectorImpl.PING_ACK;
-import static io.scalecube.cluster.fdetector.FailureDetectorImpl.PING_REQ;
-import static io.scalecube.cluster.gossip.GossipProtocolImpl.GOSSIP_REQ;
-import static io.scalecube.cluster.membership.MembershipProtocolImpl.MEMBERSHIP_GOSSIP;
-import static io.scalecube.cluster.membership.MembershipProtocolImpl.SYNC;
-import static io.scalecube.cluster.membership.MembershipProtocolImpl.SYNC_ACK;
-
 import io.scalecube.cluster.fdetector.FailureDetectorImpl;
 import io.scalecube.cluster.gossip.GossipProtocolImpl;
+import io.scalecube.cluster.membership.IdGenerator;
 import io.scalecube.cluster.membership.MembershipEvent;
 import io.scalecube.cluster.membership.MembershipProtocolImpl;
+import io.scalecube.cluster.metadata.MetadataStoreImpl;
 import io.scalecube.transport.Address;
 import io.scalecube.transport.Message;
 import io.scalecube.transport.NetworkEmulator;
 import io.scalecube.transport.Transport;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import reactor.core.publisher.Flux;
-
-import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import reactor.core.Disposable;
+import reactor.core.Disposables;
+import reactor.core.publisher.DirectProcessor;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.FluxSink;
+import reactor.core.publisher.Mono;
+import reactor.core.publisher.MonoProcessor;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 
-/**
- * Cluster implementation.
- * 
- */
+/** Cluster implementation. */
 final class ClusterImpl implements Cluster {
 
   private static final Logger LOGGER = LoggerFactory.getLogger(ClusterImpl.class);
 
   private static final Set<String> SYSTEM_MESSAGES =
-      Collections.unmodifiableSet(Stream.of(PING, PING_REQ, PING_ACK, SYNC, SYNC_ACK, GOSSIP_REQ)
-          .collect(Collectors.toSet()));
+      Collections.unmodifiableSet(
+          Stream.of(
+                  FailureDetectorImpl.PING,
+                  FailureDetectorImpl.PING_REQ,
+                  FailureDetectorImpl.PING_ACK,
+                  MembershipProtocolImpl.SYNC,
+                  MembershipProtocolImpl.SYNC_ACK,
+                  GossipProtocolImpl.GOSSIP_REQ,
+                  MetadataStoreImpl.GET_METADATA_REQ,
+                  MetadataStoreImpl.GET_METADATA_RESP)
+              .collect(Collectors.toSet()));
 
-  private static final Set<String> SYSTEM_GOSSIPS = Collections.singleton(MEMBERSHIP_GOSSIP);
+  private static final Set<String> SYSTEM_GOSSIPS =
+      Collections.singleton(MembershipProtocolImpl.MEMBERSHIP_GOSSIP);
 
   private final ClusterConfig config;
 
-  private final ConcurrentMap<String, Member> members = new ConcurrentHashMap<>();
-  private final ConcurrentMap<Address, String> memberAddressIndex = new ConcurrentHashMap<>();
+  // Subject
+  private final DirectProcessor<MembershipEvent> membershipEvents = DirectProcessor.create();
+  private final FluxSink<MembershipEvent> membershipSink = membershipEvents.sink();
+
+  // Disposables
+  private final Disposable.Composite actionsDisposables = Disposables.composite();
+  private final MonoProcessor<Void> shutdown = MonoProcessor.create();
+  private final MonoProcessor<Void> onShutdown = MonoProcessor.create();
 
   // Cluster components
   private Transport transport;
+  private Member localMember;
   private FailureDetectorImpl failureDetector;
   private GossipProtocolImpl gossip;
   private MembershipProtocolImpl membership;
-
-  private Flux<Message> messageObservable;
-  private Flux<Message> gossipObservable;
+  private MetadataStoreImpl metadataStore;
+  private Scheduler scheduler;
+  private CorrelationIdGenerator cidGenerator;
 
   public ClusterImpl(ClusterConfig config) {
     this.config = Objects.requireNonNull(config);
   }
 
-  public CompletableFuture<Cluster> join0() {
-    CompletableFuture<Transport> transportFuture = Transport.bind(config.getTransportConfig());
-    CompletableFuture<Void> clusterFuture = transportFuture.thenCompose(boundTransport -> {
-      transport = boundTransport;
-      messageObservable = transport.listen()
-          .filter(msg -> !SYSTEM_MESSAGES.contains(msg.qualifier())); // filter out system gossips
+  public Mono<Cluster> join0() {
+    return Transport.bind(config.getTransportConfig())
+        .flatMap(
+            boundTransport -> {
+              transport = boundTransport;
+              localMember = createLocalMember(boundTransport.address().port());
 
-      membership = new MembershipProtocolImpl(transport, config);
-      gossip = new GossipProtocolImpl(transport, membership, config);
-      failureDetector = new FailureDetectorImpl(transport, membership, config);
-      membership.setFailureDetector(failureDetector);
-      membership.setGossipProtocol(gossip);
+              cidGenerator = new CorrelationIdGenerator(localMember.id());
+              scheduler = Schedulers.newSingle("sc-cluster-" + localMember.address().port(), true);
 
-      Member localMember = membership.member();
-      onMemberAdded(localMember);
-      membership.listen()
-          .filter(MembershipEvent::isAdded)
-          .map(MembershipEvent::member)
-          .subscribe(this::onMemberAdded, this::onError);
-      membership.listen()
-          .filter(MembershipEvent::isRemoved)
-          .map(MembershipEvent::member)
-          .subscribe(this::onMemberRemoved, this::onError);
-      membership.listen()
-          .filter(MembershipEvent::isUpdated)
-          .map(MembershipEvent::member)
-          .subscribe(this::onMemberUpdated, this::onError);
+              // Setup shutdown
+              shutdown
+                  .then(doShutdown())
+                  .doFinally(s -> onShutdown.onComplete())
+                  .subscribeOn(scheduler)
+                  .subscribe(
+                      null, ex -> LOGGER.error("Exception occurred on cluster shutdown: " + ex));
 
-      failureDetector.start();
-      gossip.start();
-      gossipObservable = gossip.listen()
-          .filter(msg -> !SYSTEM_GOSSIPS.contains(msg.qualifier())); // filter out system gossips
-      return membership.start();
-    });
-    return clusterFuture.thenApply(aVoid -> ClusterImpl.this);
+              failureDetector =
+                  new FailureDetectorImpl(
+                      localMember,
+                      transport,
+                      membershipEvents.onBackpressureBuffer(),
+                      config,
+                      scheduler,
+                      cidGenerator);
+
+              gossip =
+                  new GossipProtocolImpl(
+                      localMember,
+                      transport,
+                      membershipEvents.onBackpressureBuffer(),
+                      config,
+                      scheduler);
+
+              metadataStore =
+                  new MetadataStoreImpl(
+                      localMember,
+                      transport,
+                      config.getMetadata(),
+                      config,
+                      scheduler,
+                      cidGenerator);
+
+              membership =
+                  new MembershipProtocolImpl(
+                      localMember,
+                      transport,
+                      failureDetector,
+                      gossip,
+                      metadataStore,
+                      config,
+                      scheduler,
+                      cidGenerator);
+
+              actionsDisposables.add(
+                  membership
+                      .listen()
+                      /*.publishOn(scheduler)*/
+                      // dont uncomment, already beign executed inside sc-cluster thread
+                      .subscribe(
+                          membershipSink::next,
+                          th -> LOGGER.error("Received unexpected error: ", th)));
+
+              failureDetector.start();
+              gossip.start();
+              metadataStore.start();
+
+              return membership.start();
+            })
+        .thenReturn(this);
   }
 
-  private void onError(Throwable throwable) {
-    LOGGER.error("Received unexpected error: ", throwable);
-  }
+  /**
+   * Creates and prepares local cluster member. An address of member that's being constructed may be
+   * overriden from config variables.
+   *
+   * @param listenPort transport listen port
+   * @return local cluster member with cluster address and cluster member id
+   */
+  private Member createLocalMember(int listenPort) {
+    String localAddress = Address.getLocalIpAddress().getHostAddress();
+    Integer port = Optional.ofNullable(config.getMemberPort()).orElse(listenPort);
 
-  private void onMemberAdded(Member member) {
-    memberAddressIndex.put(member.address(), member.id());
-    members.put(member.id(), member);
-  }
-
-  private void onMemberRemoved(Member member) {
-    members.remove(member.id());
-    memberAddressIndex.remove(member.address());
-  }
-
-  private void onMemberUpdated(Member member) {
-    members.put(member.id(), member);
+    // calculate local member cluster address
+    Address memberAddress =
+        Optional.ofNullable(config.getMemberHost())
+            .map(memberHost -> Address.create(memberHost, port))
+            .orElseGet(() -> Address.create(localAddress, listenPort));
+    return new Member(IdGenerator.generateId(), memberAddress);
   }
 
   @Override
@@ -128,102 +175,171 @@ final class ClusterImpl implements Cluster {
   }
 
   @Override
-  public void send(Member member, Message message) {
-    transport.send(member.address(), message);
+  public Mono<Void> send(Member member, Message message) {
+    return send(member.address(), message);
   }
 
   @Override
-  public void send(Address address, Message message) {
-    transport.send(address, message);
+  public Mono<Void> send(Address address, Message message) {
+    return transport.send(address, message);
   }
 
   @Override
-  public void send(Member member, Message message, CompletableFuture<Void> promise) {
-    transport.send(member.address(), message, promise);
+  public Mono<Message> requestResponse(Address address, Message request) {
+    return transport.requestResponse(request, address);
   }
 
   @Override
-  public void send(Address address, Message message, CompletableFuture<Void> promise) {
-    transport.send(address, message, promise);
+  public Mono<Message> requestResponse(Member member, Message request) {
+    return transport.requestResponse(request, member.address());
   }
 
   @Override
   public Flux<Message> listen() {
-    return messageObservable;
+    // filter out system messages
+    return transport.listen().filter(msg -> !SYSTEM_MESSAGES.contains(msg.qualifier()));
   }
 
   @Override
-  public CompletableFuture<String> spreadGossip(Message message) {
+  public Mono<String> spreadGossip(Message message) {
     return gossip.spread(message);
   }
 
   @Override
   public Flux<Message> listenGossips() {
-    return gossipObservable;
+    // filter out system gossips
+    return gossip.listen().filter(msg -> !SYSTEM_GOSSIPS.contains(msg.qualifier()));
   }
 
   @Override
   public Collection<Member> members() {
-    return Collections.unmodifiableCollection(members.values());
-  }
-
-  @Override
-  public Member member() {
-    return membership.member();
-  }
-
-  @Override
-  public Optional<Member> member(String id) {
-    return Optional.ofNullable(members.get(id));
-  }
-
-  @Override
-  public Optional<Member> member(Address address) {
-    return Optional.ofNullable(memberAddressIndex.get(address))
-        .flatMap(memberId -> Optional.ofNullable(members.get(memberId)));
+    return membership.members();
   }
 
   @Override
   public Collection<Member> otherMembers() {
-    ArrayList<Member> otherMembers = new ArrayList<>(members.values());
-    otherMembers.remove(membership.member());
-    return Collections.unmodifiableCollection(otherMembers);
+    return membership.otherMembers();
   }
 
   @Override
-  public void updateMetadata(Map<String, String> metadata) {
-    membership.updateMetadata(metadata);
+  public Map<String, String> metadata() {
+    return metadataStore.metadata();
   }
 
   @Override
-  public void updateMetadataProperty(String key, String value) {
-    membership.updateMetadataProperty(key, value);
+  public Map<String, String> metadata(Member member) {
+    return metadataStore.metadata(member);
+  }
+
+  @Override
+  public Member member() {
+    return localMember;
+  }
+
+  @Override
+  public Optional<Member> member(String id) {
+    return membership.member(id);
+  }
+
+  @Override
+  public Optional<Member> member(Address address) {
+    return membership.member(address);
+  }
+
+  @Override
+  public Mono<Void> updateMetadata(Map<String, String> metadata) {
+    return Mono.fromRunnable(() -> metadataStore.updateMetadata(metadata))
+        .then(membership.updateIncarnation())
+        .subscribeOn(scheduler);
+  }
+
+  @Override
+  public Mono<Void> updateMetadataProperty(String key, String value) {
+    return Mono.fromCallable(() -> updateMetadataProperty0(key, value))
+        .flatMap(this::updateMetadata)
+        .subscribeOn(scheduler);
+  }
+
+  private Map<String, String> updateMetadataProperty0(String key, String value) {
+    Map<String, String> metadata = new HashMap<>(metadataStore.metadata());
+    metadata.put(key, value);
+    return metadata;
+  }
+
+  public Mono<Void> removeMetadataProperty(String key) {
+    return Mono.fromCallable(() -> removeMetadataProperty0(key))
+        .flatMap(this::updateMetadata)
+        .subscribeOn(scheduler)
+        .then();
+  }
+
+  private Map<String, String> removeMetadataProperty0(String key) {
+    Map<String, String> metadata = new HashMap<>(metadataStore.metadata());
+    metadata.remove(key);
+    return metadata;
   }
 
   @Override
   public Flux<MembershipEvent> listenMembership() {
-    return membership.listen();
+    return Flux.defer(
+        () ->
+            Flux.fromIterable(otherMembers())
+                .map(member -> MembershipEvent.createAdded(member, metadata(member)))
+                .concatWith(membershipEvents)
+                .onBackpressureBuffer());
   }
 
   @Override
-  public CompletableFuture<Void> shutdown() {
-    LOGGER.info("Cluster member {} is shutting down...", membership.member());
-    CompletableFuture<Void> transportStoppedFuture = new CompletableFuture<>();
-    membership.leave()
-        .whenComplete((gossipId, error) -> {
-          LOGGER.info("Cluster member notified about his leaving and shutting down... {}", membership.member());
+  public Mono<Void> shutdown() {
+    return Mono.defer(
+        () -> {
+          shutdown.onComplete();
+          return onShutdown;
+        });
+  }
+
+  private Mono<Void> doShutdown() {
+    return Mono.defer(
+        () -> {
+          LOGGER.info("Cluster member {} is shutting down", localMember);
+          return Flux.concatDelayError(leaveCluster(localMember), dispose(), transport.stop())
+              .then()
+              .doOnSuccess(avoid -> LOGGER.info("Cluster member {} has shut down", localMember));
+        });
+  }
+
+  private Mono<Void> leaveCluster(Member member) {
+    return membership
+        .leaveCluster()
+        .doOnSuccess(
+            s ->
+                LOGGER.info(
+                    "Cluster member {} notified about his leaving and shutting down", member))
+        .doOnError(
+            e ->
+                LOGGER.warn(
+                    "Cluster member {} failed to spread leave notification "
+                        + "to other cluster members: {}",
+                    member,
+                    e))
+        .then();
+  }
+
+  private Mono<Void> dispose() {
+    return Mono.fromRunnable(
+        () -> {
+          // Stop accepting requests
+          actionsDisposables.dispose();
 
           // stop algorithms
+          metadataStore.stop();
           membership.stop();
           gossip.stop();
           failureDetector.stop();
 
-          // stop transport
-          transport.stop(transportStoppedFuture);
-
-          LOGGER.info("Cluster member has shut down... {}", membership.member());
+          // stop scheduler
+          scheduler.dispose();
         });
-    return transportStoppedFuture;
   }
 
   @Override
@@ -233,6 +349,6 @@ final class ClusterImpl implements Cluster {
 
   @Override
   public boolean isShutdown() {
-    return this.transport.isStopped(); // since transport is the last component stopped on shutdown
+    return onShutdown.isDisposed();
   }
 }

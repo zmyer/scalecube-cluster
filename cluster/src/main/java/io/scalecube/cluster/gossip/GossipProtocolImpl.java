@@ -3,22 +3,9 @@ package io.scalecube.cluster.gossip;
 import io.scalecube.cluster.ClusterMath;
 import io.scalecube.cluster.Member;
 import io.scalecube.cluster.membership.MembershipEvent;
-import io.scalecube.cluster.membership.MembershipProtocol;
+import io.scalecube.transport.Address;
 import io.scalecube.transport.Message;
 import io.scalecube.transport.Transport;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import reactor.core.Disposable;
-import reactor.core.Disposables;
-import reactor.core.publisher.DirectProcessor;
-import reactor.core.publisher.Flux;
-import reactor.core.publisher.FluxProcessor;
-import reactor.core.publisher.FluxSink;
-import reactor.core.scheduler.Scheduler;
-import reactor.core.scheduler.Schedulers;
-
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -27,12 +14,19 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import reactor.core.Disposable;
+import reactor.core.Disposables;
+import reactor.core.publisher.DirectProcessor;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.FluxProcessor;
+import reactor.core.publisher.FluxSink;
+import reactor.core.publisher.Mono;
+import reactor.core.publisher.MonoSink;
+import reactor.core.scheduler.Scheduler;
 
 public final class GossipProtocolImpl implements GossipProtocol {
 
@@ -44,16 +38,16 @@ public final class GossipProtocolImpl implements GossipProtocol {
 
   // Injected
 
+  private final Member localMember;
   private final Transport transport;
-  private final MembershipProtocol membership;
   private final GossipConfig config;
 
   // Local State
 
-  private long period = 0;
+  private long currentPeriod = 0;
   private long gossipCounter = 0;
   private Map<String, GossipState> gossips = new HashMap<>();
-  private Map<String, CompletableFuture<String>> futures = new HashMap<>();
+  private Map<String, MonoSink<String>> futures = new HashMap<>();
 
   private List<Member> remoteMembers = new ArrayList<>();
   private int remoteMembersIndex = -1;
@@ -71,94 +65,66 @@ public final class GossipProtocolImpl implements GossipProtocol {
 
   // Scheduled
 
-  private final ScheduledExecutorService executor;
   private final Scheduler scheduler;
-  private ScheduledFuture<?> spreadGossipTask;
 
   /**
    * Creates new instance of gossip protocol with given memberId, transport and settings.
    *
-   * @param transport transport
-   * @param membership membership protocol
+   * @param localMember local cluster member
+   * @param transport cluster transport
+   * @param membershipProcessor membership event processor
    * @param config gossip protocol settings
+   * @param scheduler scheduler
    */
-  public GossipProtocolImpl(Transport transport, MembershipProtocol membership, GossipConfig config) {
+  public GossipProtocolImpl(
+      Member localMember,
+      Transport transport,
+      Flux<MembershipEvent> membershipProcessor,
+      GossipConfig config,
+      Scheduler scheduler) {
+
     this.transport = Objects.requireNonNull(transport);
-    this.membership = Objects.requireNonNull(membership);
     this.config = Objects.requireNonNull(config);
-    String nameFormat = "sc-gossip-" + Integer.toString(membership.member().address().port());
-    this.executor = Executors.newSingleThreadScheduledExecutor(r -> {
-      Thread thread = new Thread(r);
-      thread.setName(nameFormat);
-      thread.setDaemon(true);
-      return thread;
-    });
-    this.scheduler = Schedulers.fromExecutorService(executor);
-  }
+    this.localMember = Objects.requireNonNull(localMember);
+    this.scheduler = Objects.requireNonNull(scheduler);
 
-  /**
-   * <b>NOTE:</b> this method is for testing purpose only.
-   */
-  Transport getTransport() {
-    return transport;
-  }
-
-  /**
-   * <b>NOTE:</b> this method is for testing purpose only.
-   */
-  Member getMember() {
-    return membership.member();
+    // Subscribe
+    actionsDisposables.addAll(
+        Arrays.asList(
+            membershipProcessor //
+                .publishOn(scheduler)
+                .subscribe(this::onMemberEvent, this::onError),
+            transport
+                .listen()
+                .publishOn(scheduler)
+                .filter(this::isGossipReq)
+                .subscribe(this::onGossipReq, this::onError)));
   }
 
   @Override
   public void start() {
-    actionsDisposables.addAll(Arrays.asList(
-        membership.listen()
-            .publishOn(scheduler)
-            .filter(MembershipEvent::isAdded)
-            .map(MembershipEvent::member)
-            .subscribe(remoteMembers::add, this::onError),
-        membership.listen()
-            .publishOn(scheduler)
-            .filter(MembershipEvent::isRemoved)
-            .map(MembershipEvent::member)
-            .subscribe(remoteMembers::remove, this::onError),
-        transport.listen()
-            .publishOn(scheduler)
-            .filter(this::isGossipReq)
-            .subscribe(this::onGossipReq, this::onError)));
-
-    spreadGossipTask = executor.scheduleWithFixedDelay(this::doSpreadGossip,
-        config.getGossipInterval(), config.getGossipInterval(), TimeUnit.MILLISECONDS);
-  }
-
-  private void onError(Throwable throwable) {
-    LOGGER.error("Received unexpected error: ", throwable);
+    actionsDisposables.add(
+        scheduler.schedulePeriodically(
+            this::doSpreadGossip,
+            config.getGossipInterval(),
+            config.getGossipInterval(),
+            TimeUnit.MILLISECONDS));
   }
 
   @Override
   public void stop() {
-    // Stop accepting gossip requests
+    // Stop accepting gossip requests and spreading gossips
     actionsDisposables.dispose();
-
-    // Stop spreading gossips
-    if (spreadGossipTask != null) {
-      spreadGossipTask.cancel(true);
-    }
-
-    // Shutdown executor
-    // TODO AK: Consider to await termination ?!
-    executor.shutdown();
 
     // Stop publishing events
     sink.complete();
   }
 
   @Override
-  public CompletableFuture<String> spread(Message message) {
-    CompletableFuture<String> future = new CompletableFuture<>();
-    executor.execute(() -> futures.put(onSpreadGossip(message), future));
-    return future;
+  public Mono<String> spread(Message message) {
+    return Mono.fromCallable(() -> message)
+        .subscribeOn(scheduler)
+        .flatMap(msg -> Mono.create(sink -> futures.put(createAndPutGossip(msg), sink)));
   }
 
   @Override
@@ -172,7 +138,7 @@ public final class GossipProtocolImpl implements GossipProtocol {
 
   private void doSpreadGossip() {
     // Increment period
-    period++;
+    long period = currentPeriod++;
 
     // Check any gossips exists
     if (gossips.isEmpty()) {
@@ -181,12 +147,12 @@ public final class GossipProtocolImpl implements GossipProtocol {
 
     try {
       // Spread gossips to randomly selected member(s)
-      selectGossipMembers().forEach(this::spreadGossipsTo);
+      selectGossipMembers().forEach(member -> spreadGossipsTo(period, member));
 
       // Sweep gossips
-      sweepGossips();
-    } catch (Exception cause) {
-      LOGGER.error("Exception on sending GossipReq[{}] exception: {}", period, cause.getMessage(), cause);
+      sweepGossips(period);
+    } catch (Exception ex) {
+      LOGGER.warn("Exception at doSpreadGossip[{}]: {}", period, ex.getMessage(), ex);
     }
   }
 
@@ -194,7 +160,8 @@ public final class GossipProtocolImpl implements GossipProtocol {
   // ============== Event Listeners =================
   // ================================================
 
-  private String onSpreadGossip(Message message) {
+  private String createAndPutGossip(Message message) {
+    long period = this.currentPeriod;
     Gossip gossip = new Gossip(generateGossipId(), message);
     GossipState gossipState = new GossipState(gossip, period);
     gossips.put(gossip.gossipId(), gossipState);
@@ -202,6 +169,7 @@ public final class GossipProtocolImpl implements GossipProtocol {
   }
 
   private void onGossipReq(Message message) {
+    long period = this.currentPeriod;
     GossipRequest gossipRequest = message.data();
     for (Gossip gossip : gossipRequest.gossips()) {
       GossipState gossipState = gossips.get(gossip.gossipId());
@@ -214,6 +182,20 @@ public final class GossipProtocolImpl implements GossipProtocol {
     }
   }
 
+  private void onMemberEvent(MembershipEvent event) {
+    Member member = event.member();
+    if (event.isRemoved()) {
+      remoteMembers.remove(member);
+    }
+    if (event.isAdded()) {
+      remoteMembers.add(member);
+    }
+  }
+
+  private void onError(Throwable throwable) {
+    LOGGER.error("Received unexpected error: ", throwable);
+  }
+
   // ================================================
   // ============== Helper Methods ==================
   // ================================================
@@ -223,26 +205,45 @@ public final class GossipProtocolImpl implements GossipProtocol {
   }
 
   private String generateGossipId() {
-    return membership.member().id() + "-" + gossipCounter++;
+    return localMember.id() + "-" + gossipCounter++;
   }
 
-  private void spreadGossipsTo(Member member) {
+  private void spreadGossipsTo(long period, Member member) {
     // Select gossips to send
-    List<Gossip> gossipsToSend = selectGossipsToSend(member);
-    if (gossipsToSend.isEmpty()) {
+    List<Gossip> gossips = selectGossipsToSend(period, member);
+    if (gossips.isEmpty()) {
       return; // nothing to spread
     }
 
     // Send gossip request
-    Message gossipReqMsg = buildGossipRequestMessage(gossipsToSend);
-    transport.send(member.address(), gossipReqMsg);
+    Address address = member.address();
+
+    gossips
+        .stream()
+        .map(this::buildGossipRequestMessage)
+        .forEach(
+            message ->
+                transport
+                    .send(address, message)
+                    .subscribe(
+                        null,
+                        ex ->
+                            LOGGER.debug(
+                                "Failed to send GossipReq[{}]: {} to {}, cause: {}",
+                                period,
+                                message,
+                                address,
+                                ex.toString())));
   }
 
-  private List<Gossip> selectGossipsToSend(Member member) {
+  private List<Gossip> selectGossipsToSend(long period, Member member) {
     int periodsToSpread =
         ClusterMath.gossipPeriodsToSpread(config.getGossipRepeatMult(), remoteMembers.size() + 1);
-    return gossips.values().stream()
-        .filter(gossipState -> gossipState.infectionPeriod() + periodsToSpread >= period) // max rounds
+    return gossips
+        .values()
+        .stream()
+        .filter(
+            gossipState -> gossipState.infectionPeriod() + periodsToSpread >= period) // max rounds
         .filter(gossipState -> !gossipState.isInfected(member.id())) // already infected
         .map(GossipState::gossip)
         .collect(Collectors.toList());
@@ -260,9 +261,10 @@ public final class GossipProtocolImpl implements GossipProtocol {
       }
 
       // Select members
-      List<Member> selectedMembers = gossipFanout == 1
-          ? Collections.singletonList(remoteMembers.get(remoteMembersIndex))
-          : remoteMembers.subList(remoteMembersIndex, remoteMembersIndex + gossipFanout);
+      List<Member> selectedMembers =
+          gossipFanout == 1
+              ? Collections.singletonList(remoteMembers.get(remoteMembersIndex))
+              : remoteMembers.subList(remoteMembersIndex, remoteMembersIndex + gossipFanout);
 
       // Increment index and return result
       remoteMembersIndex += gossipFanout;
@@ -270,17 +272,24 @@ public final class GossipProtocolImpl implements GossipProtocol {
     }
   }
 
-  private Message buildGossipRequestMessage(List<Gossip> gossipsToSend) {
-    GossipRequest gossipReqData = new GossipRequest(gossipsToSend, membership.member().id());
-    return Message.withData(gossipReqData).qualifier(GOSSIP_REQ).build();
+  private Message buildGossipRequestMessage(Gossip gossip) {
+    GossipRequest gossipRequest = new GossipRequest(gossip, localMember.id());
+    return Message.withData(gossipRequest)
+        .qualifier(GOSSIP_REQ)
+        .sender(localMember.address())
+        .build();
   }
 
-  private void sweepGossips() {
+  private void sweepGossips(long period) {
     // Select gossips to sweep
-    int periodsToSweep = ClusterMath.gossipPeriodsToSweep(config.getGossipRepeatMult(), remoteMembers.size() + 1);
-    Set<GossipState> gossipsToRemove = gossips.values().stream()
-        .filter(gossipState -> period > gossipState.infectionPeriod() + periodsToSweep)
-        .collect(Collectors.toSet());
+    int periodsToSweep =
+        ClusterMath.gossipPeriodsToSweep(config.getGossipRepeatMult(), remoteMembers.size() + 1);
+    Set<GossipState> gossipsToRemove =
+        gossips
+            .values()
+            .stream()
+            .filter(gossipState -> period > gossipState.infectionPeriod() + periodsToSweep)
+            .collect(Collectors.toSet());
 
     // Check if anything selected
     if (gossipsToRemove.isEmpty()) {
@@ -288,13 +297,31 @@ public final class GossipProtocolImpl implements GossipProtocol {
     }
 
     // Sweep gossips
-    LOGGER.debug("Sweep gossips: {}", gossipsToRemove);
+    LOGGER.debug("Sweep gossips[{}]: {}", period, gossipsToRemove);
     for (GossipState gossipState : gossipsToRemove) {
       gossips.remove(gossipState.gossip().gossipId());
-      CompletableFuture<String> future = futures.remove(gossipState.gossip().gossipId());
-      if (future != null) {
-        future.complete(gossipState.gossip().gossipId());
+      MonoSink<String> sink = futures.remove(gossipState.gossip().gossipId());
+      if (sink != null) {
+        sink.success(gossipState.gossip().gossipId());
       }
     }
+  }
+
+  /**
+   * <b>NOTE:</b> this method is for testing purpose only.
+   *
+   * @return transport
+   */
+  Transport getTransport() {
+    return transport;
+  }
+
+  /**
+   * <b>NOTE:</b> this method is for testing purpose only.
+   *
+   * @return local member
+   */
+  Member getMember() {
+    return localMember;
   }
 }

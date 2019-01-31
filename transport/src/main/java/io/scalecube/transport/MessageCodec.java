@@ -1,65 +1,27 @@
 package io.scalecube.transport;
 
-import io.netty.buffer.ByteBuf;
-import io.netty.buffer.ByteBufInputStream;
-import io.netty.buffer.ByteBufOutputStream;
-import io.netty.handler.codec.DecoderException;
-import io.netty.handler.codec.EncoderException;
-import io.protostuff.ProtostuffIOUtil;
-import io.protostuff.Schema;
-import io.protostuff.runtime.RuntimeSchema;
+import java.io.InputStream;
+import java.io.OutputStream;
 
 /**
- * Contains static methods for message serializing/deserializing logic.
- *
+ * Contains methods for message serializing/deserializing logic.
  */
-public final class MessageCodec {
-
-  private static final RecyclableLinkedBuffer recyclableLinkedBuffer = new RecyclableLinkedBuffer();
-
-  static {
-    // Register message schema
-    if (!RuntimeSchema.isRegistered(Message.class)) {
-      RuntimeSchema.register(Message.class, new MessageSchema());
-    }
-  }
-
-  private MessageCodec() {
-    // Do not instantiate
-  }
+public interface MessageCodec {
 
   /**
-   * Deserializes message from given byte buffer.
+   * Deserializes message from given input stream.
    *
-   * @param bb byte buffer
+   * @param stream input stream
+   *
+   * @return message from the input stream
    */
-  public static Message deserialize(ByteBuf bb) {
-    Schema<Message> schema = RuntimeSchema.getSchema(Message.class);
-    Message message = schema.newMessage();
-    try {
-      ProtostuffIOUtil.mergeFrom(new ByteBufInputStream(bb), message, schema);
-    } catch (Exception e) {
-      throw new DecoderException(e.getMessage(), e);
-    }
-
-    return message;
-  }
+  Message deserialize(InputStream stream) throws Exception;
 
   /**
-   * Serializes given message into byte buffer.
+   * Serializes given message into given output stream.
    *
-   * @param message message to serialize
-   * @param bb byte buffer of where to write serialzied message
+   * @param message message
+   * @param stream output stream
    */
-  public static void serialize(Message message, ByteBuf bb) {
-    Schema<Message> schema = RuntimeSchema.getSchema(Message.class);
-    try (RecyclableLinkedBuffer rlb = recyclableLinkedBuffer.get()) {
-      try {
-        ProtostuffIOUtil.writeTo(new ByteBufOutputStream(bb), message, schema, rlb.buffer());
-      } catch (Exception e) {
-        throw new EncoderException(e.getMessage(), e);
-      }
-    }
-  }
-
+  void serialize(Message message, OutputStream stream) throws Exception;
 }
